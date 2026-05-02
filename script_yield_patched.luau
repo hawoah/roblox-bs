@@ -2296,7 +2296,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local OPTIONS = {
 		mode = "optimized",
-		Decompile = true,
+		Decompile = false, -- optimization: avoid expensive script decompilation by default
 		scriptcache = true,
 		-- decomptype = "",
 		DecompileTimeout = 10,
@@ -2326,12 +2326,12 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		NilInstances = false,
 		NilInstancesFixes = {},
 
-		SaveCacheInterval = 0x1600 * 10,
-		YieldInterval = 0.01, -- seconds; set false or <= 0 to disable cooperative yielding
+		SaveCacheInterval = 7500, -- optimization: fewer file flushes/appends
+		YieldInterval = 0.05, -- seconds; set false or <= 0 to disable cooperative yielding
 		ShowStatus = true,
 		KillAllScripts = true,
-		SafeMode = true,
-		BoostFPS = false,
+		SafeMode = false, -- optimization: avoids extra SafeMode work unless explicitly requested
+		BoostFPS = true, -- optimization: reduce rendering overhead where supported
 		ShutdownWhenDone = false,
 		AntiIdle = true,
 		Anonymous = false,
@@ -2554,7 +2554,11 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				if success then
 					return result
 				end
-				task.wait(1)
+				if task and type(task.wait) == "function" then
+					task.wait(1)
+				elseif type(wait) == "function" then
+					wait(1)
+				end
 			end
 		end
 
@@ -2579,13 +2583,49 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return
 	end
 
-	local YieldInterval = tonumber(OPTIONS.YieldInterval) or 0.01
-	local lastYield = os.clock()
-	local function maybe_yield()
-		if YieldInterval > 0 and os.clock() - lastYield > YieldInterval then
-			task.wait()
-			lastYield = os.clock()
+	-- Hot-path local aliases. Tiny savings individually, useful in the giant loops below.
+	local clock = os.clock
+	local table_create = table.create
+	local table_insert = table.insert
+	local type = type
+	local typeof = typeof
+	local pcall = pcall
+	local next = next
+
+	local wait_fn
+	do
+		if task and type(task.wait) == "function" then
+			wait_fn = task.wait
+		elseif type(wait) == "function" then
+			wait_fn = wait
+		else
+			wait_fn = function() end -- no-op fallback; prevents nil-call crashes in weird executors
 		end
+	end
+
+	local YieldInterval = tonumber(OPTIONS.YieldInterval) or 0.05
+	local lastYield = clock()
+	local workCounter = 0
+	local WORK_CHECK_INTERVAL = 128
+
+	local function maybe_yield()
+		if YieldInterval > 0 and clock() - lastYield >= YieldInterval then
+			wait_fn()
+			lastYield = clock()
+		end
+	end
+
+	local function maybe_yield_work()
+		workCounter += 1
+
+		if workCounter >= WORK_CHECK_INTERVAL then
+			workCounter = 0
+			maybe_yield()
+		end
+	end
+
+	local function get_children(instance)
+		return instance:GetChildren()
 	end
 
 	if OPTIONS.IgnoreDefaultPlayerScripts then
@@ -2605,13 +2645,13 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		local function ignorePath(path)
 			if path then
-				for _, child in path:GetChildren() do
-					maybe_yield()
+				for _, child in get_children(path) do
+					maybe_yield_work()
 					local class_match = default_scripts[child.ClassName]
 					if class_match then
 						local name_match = class_match[child.Name]
 						if name_match then
-							table.insert(DecompileIgnore, child)
+							table_insert(DecompileIgnore, child)
 						end
 					end
 				end
@@ -2792,14 +2832,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					local tmp_dict = ArrayToDict(tmp)
 					for _, child in Children do
 						if not tmp_dict[child] then
-							table.insert(tmp, child)
+							table_insert(tmp, child)
 						end
 					end
 				end
 			end
 		elseif mode == "optimized" then -- ! Incompatible with .rbxmx (Model file) mode
 			-- if IsolatePlayers then
-			-- 	table.insert(_list_0, "Players")
+			-- 	table_insert(_list_0, "Players")
 			-- end
 			local tmp_dict = ArrayToDict(tmp)
 
@@ -2833,7 +2873,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			do
 				local _service = game:FindService(serviceName)
 				if _service and not tmp_dict[_service] then
-					table.insert(tmp, _service)
+					table_insert(tmp, _service)
 				end
 			end
 		elseif mode == "scripts" then
@@ -2853,14 +2893,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				end
 			end
 			for instance in unique do
-				table.insert(tmp, instance)
+				table_insert(tmp, instance)
 			end
 		end
 
 		ToSaveList = tmp
 
 		if ToSaveInstance then
-			table.insert(ToSaveList, 1, ToSaveInstance)
+			table_insert(ToSaveList, 1, ToSaveInstance)
 		end
 	end
 
@@ -2926,7 +2966,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 				while true do
 					StatusText.Text = text .. getLoadingText()
-					task.wait(0.25)
+					wait_fn(0.25)
 				end
 			end)
 			if waitForRender then
@@ -2969,7 +3009,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				task.cancel(timeoutThread)
 
 				while coroutine.status(thread) ~= "suspended" do
-					task.wait()
+					wait_fn()
 				end
 
 				coroutine.resume(thread, ok, result)
@@ -3031,7 +3071,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						return "-- Not found in already decompiled ScriptCache"
 					end
 
-					-- task.wait() -- TODO Maybe remove?
+					-- wait_fn() -- TODO Maybe remove?
 				end
 
 				local ok, result = run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script)
@@ -3110,7 +3150,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				break
 			end
 
-			table.insert(subStrings, string.sub(input, init, start - 1))
+			table_insert(subStrings, string.sub(input, init, start - 1))
 
 			lastFinish = finish
 		end
@@ -3119,7 +3159,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			return input
 		end
 
-		table.insert(subStrings, string.sub(input, lastFinish + 1))
+		table_insert(subStrings, string.sub(input, lastFinish + 1))
 
 		return table.concat(subStrings, replacement)
 	end
@@ -3261,7 +3301,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		totalsize += savestr_len
 
 		-- store chunk as-is (NO concatenation accumulation)
-		table.insert(chunks, savestr)
+		table_insert(chunks, savestr)
 
 		table.clear(savebuffer)
 		savebuffer_size = 1
@@ -3301,8 +3341,33 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	local gethiddenproperty_fallback
 
 	local function save_hierarchy(hierarchy)
-		for _, instance in hierarchy do
-			maybe_yield()
+		local stack = table_create(#hierarchy)
+		local closing = table_create(#hierarchy)
+		local stack_size = 0
+
+		for i = #hierarchy, 1, -1 do
+			stack_size += 1
+			stack[stack_size] = hierarchy[i]
+		end
+
+		while stack_size > 0 do
+			maybe_yield_work()
+
+			local instance = stack[stack_size]
+			local isClosing = closing[stack_size]
+			stack[stack_size] = nil
+			closing[stack_size] = nil
+			stack_size -= 1
+
+			if isClosing then
+				if DecompileIgnoring and DecompileIgnoring == instance then
+					DecompileIgnoring = nil
+				end
+
+				savebuffer[savebuffer_size] = "</Item>"
+				savebuffer_size += 1
+				continue
+			end
 			local InstanceOverride, ClassTagOverride, ClassNameOverride
 
 			if not InstanceOverride then
@@ -3414,7 +3479,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					end
 
 					for _, Property in GetInheritedProps(ClassNameOverride or ClassName) do
-						maybe_yield()
+						maybe_yield_work()
 						local PropertyName = Property.Name
 
 						if IgnoreProperties[PropertyName] then
@@ -3558,7 +3623,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 										if hasLinkedSource then
 											local Path = instance:GetFullName()
 											if RecoveredScripts then
-												table.insert(RecoveredScripts, Path)
+												table_insert(RecoveredScripts, Path)
 											end
 
 											LinkedSource = string.match(LinkedSource_Url, "%w+$") -- TODO: No sure if this pattern matches all possible cases. Example is: 'rbxassetid://0&hash=cd73dd2fe5e5013137231c227da3167e'
@@ -3671,10 +3736,20 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 
 			if SkipEntirely ~= false then -- ? We save instance without it's descendants in this case (== false)
-				local Children = InstanceOverride and InstanceOverride.__Children or instance:GetChildren()
+				local Children = InstanceOverride and InstanceOverride.__Children or get_children(instance)
 
 				if #Children ~= 0 then
-					save_hierarchy(Children)
+					-- Iterative DFS: avoids recursive stack growth and lets yielding stay centralized.
+					stack_size += 1
+					stack[stack_size] = instance
+					closing[stack_size] = true
+
+					for i = #Children, 1, -1 do
+						stack_size += 1
+						stack[stack_size] = Children[i]
+					end
+
+					continue
 				end
 			end
 
@@ -3699,7 +3774,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			if type(instanceOrTable) == "table" then
 				hierarchy = instanceOrTable
 			else
-				hierarchy = instanceOrTable:GetChildren()
+				hierarchy = get_children(instanceOrTable)
 				if saveProps then
 					-- IgnoreList[instanceOrTable] = nil
 					-- IgnoreNotArchivable = false
@@ -3781,7 +3856,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			local NilInstancesFixes = OPTIONS.NilInstancesFixes
 
 			for _, instance in global_container.getnilinstances() do
-				maybe_yield()
+				maybe_yield_work()
 				if instance == game then
 					instance = nil
 					-- break
@@ -3886,7 +3961,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		do
 			local tmp = { "<SharedStrings>" }
 			for value, identifier in SharedStrings do
-				table.insert(tmp, '<SharedString md5="' .. identifier .. '">' .. value .. "</SharedString>")
+				table_insert(tmp, '<SharedString md5="' .. identifier .. '">' .. value .. "</SharedString>")
 			end
 
 			if 1 < #tmp then -- next(SharedStrings) check also works but seems to be slower
@@ -3903,7 +3978,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		save_cache()
 		do
 			local function buildFinalString(chunks)
-				local parts = table.create(#chunks + 1)
+				local parts = table_create(#chunks + 1)
 				parts[1] = header
 
 				table.move(chunks, 1, #chunks, 2, parts)
@@ -3943,7 +4018,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						offset += SEGMENT_SIZE
 
 						if offset <= chunk_len then
-							task.wait()
+							wait_fn()
 						end
 					end
 				end
@@ -3962,7 +4037,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 	local Connections = {}
 	local function Connect(event, func)
-		table.insert(Connections, event:Connect(func))
+		table_insert(Connections, event:Connect(func))
 	end
 	local function Cleanup()
 		for _, connection in Connections do
@@ -4094,7 +4169,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		local function randomString()
 			local length = math.random(10, 20)
-			local randomarray = table.create(length)
+			local randomarray = table_create(length)
 			for i = 1, length do
 				randomarray[i] = string.char(math.random(32, 126))
 			end
@@ -4129,12 +4204,12 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				local PlayerScripts = LocalPlayer:FindFirstChildOfClass("PlayerScripts")
 				if PlayerScripts then
 					local function construct_InstanceOverride(instance)
-						local children = instance:GetChildren()
+						local children = get_children(instance)
 						InstancesOverrides[instance] = {
 							__Children = children,
 						}
 						for _, child in children do
-							maybe_yield()
+							maybe_yield_work()
 							construct_InstanceOverride(child)
 						end
 					end
@@ -4212,7 +4287,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					end
 				end
 				local function benchmark(funcs, ...)
-					local ranking = table.create(2)
+					local ranking = table_create(2)
 					for i, f in funcs do
 						local start = os.clock()
 						for _ = 1, 50 do
@@ -4341,7 +4416,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				if ok then
 					StatusText.Text = string.format("Saved! Time %.3f seconds; Size %s", elapse_t, get_size_format())
 					StatusText.TextColor3 = Color3.new(0, 1)
-					task.wait(Log10 * 2 + ExtraTime)
+					wait_fn(Log10 * 2 + ExtraTime)
 				else
 					if Loading then
 						task.cancel(Loading)
@@ -4351,14 +4426,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					StatusText.TextColor3 = Color3.new(1)
 					warn("Error found while saving:")
 					warn(err)
-					task.wait(Log10 + ExtraTime)
+					wait_fn(Log10 + ExtraTime)
 				end
 				StatusText:Destroy()
 			end)
 		end
 
 		if OPTIONS.ShutdownWhenDone and ok then
-			task.wait(Log10 * 2 + ExtraTime)
+			wait_fn(Log10 * 2 + ExtraTime)
 			game:Shutdown()
 		end
 	end
