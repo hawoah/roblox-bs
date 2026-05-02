@@ -2580,13 +2580,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 
 	local YieldInterval = tonumber(OPTIONS.YieldInterval) or 0.01
-	local yield = if task and task.wait then task.wait else wait
 	local lastYield = os.clock()
 	local function maybe_yield()
 		if YieldInterval > 0 and os.clock() - lastYield > YieldInterval then
-			if yield then
-				yield()
-			end
+			task.wait()
 			lastYield = os.clock()
 		end
 	end
